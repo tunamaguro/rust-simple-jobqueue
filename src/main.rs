@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use futures::{StreamExt as _, TryStreamExt as _};
+use futures::{FutureExt, StreamExt as _, TryStreamExt as _};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sqlx::PgPool;
 
@@ -61,16 +61,39 @@ impl<Data: Serialize + DeserializeOwned> Client<Data> {
     }
 }
 
-#[derive(Debug)]
-pub struct PollerContext {
-    id: sqlx::types::Uuid,
-    tx: sqlx::Transaction<'static, sqlx::Postgres>,
+struct Ticker {
+    inner: tokio::time::Interval,
+}
+
+impl Ticker {
+    fn new(interval: std::time::Duration) -> Self {
+        Self {
+            inner: tokio::time::interval(interval),
+        }
+    }
+}
+
+impl futures::Stream for Ticker {
+    type Item = ();
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.inner.poll_tick(cx).map(|_| Some(()))
+    }
 }
 
 #[derive(Debug)]
 pub struct JobData<T> {
     context: PollerContext,
     data: T,
+}
+
+#[derive(Debug)]
+pub struct PollerContext {
+    id: sqlx::types::Uuid,
+    tx: sqlx::Transaction<'static, sqlx::Postgres>,
 }
 
 #[derive(Debug, Clone)]
@@ -135,6 +158,52 @@ impl Poller {
     }
 }
 
+pub struct Runner {
+    ticker: Ticker,
+    poller: Poller,
+}
+
+impl Runner {
+    fn new(poller: Poller, interval: std::time::Duration) -> Self {
+        Self {
+            ticker: Ticker::new(interval),
+            poller,
+        }
+    }
+
+    pub async fn run<F, Fut, T, E>(
+        self,
+        func: F,
+        concurrent: usize,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>>
+    where
+        F: Fn(T) -> Fut + Clone + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), E>>,
+        T: serde::de::DeserializeOwned,
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        let data_stream = self
+            .ticker
+            .then(|_| self.poller.poll::<T>())
+            .filter_map(|res| async move { res.ok() })
+            .map(|job| async {
+                let func = func.clone();
+                let fut = func(job.data);
+                if let Err(e) = fut.await {
+                    eprintln!("Error processing job: {}", e);
+                }
+                job.context.tx.commit().await
+            })
+            .buffer_unordered(concurrent);
+        let mut data_stream = Box::pin(data_stream);
+
+        while let Some(job) = data_stream.next().await {
+            job?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Message {
     text: String,
@@ -147,10 +216,9 @@ async fn main() {
         .unwrap();
 
     let client = Client::new::<Message>(pool.clone());
-    let poller = Arc::new(Poller::new(pool));
 
-    let mut st = futures::stream::iter(0..100)
-        .map(|num| {
+    let st = futures::stream::iter(0..100)
+        .map(move |num| {
             let client = client.clone();
 
             tokio::spawn(async move {
@@ -162,20 +230,23 @@ async fn main() {
                 fut.await
             })
         })
-        .buffer_unordered(8)
-        .map(|x| x.unwrap())
-        .map(|_| {
-            let poller = poller.clone();
-            tokio::spawn(async move {
-                let poller = poller;
-                let fut = poller.poll_and_run(async |data: Message| {
-                    println!("message: {}", data.text);
-                    Ok::<(), std::io::Error>(())
-                });
-                fut.await
-            })
-        })
         .buffer_unordered(8);
 
-    while (st.next().await).is_some() {}
+    let push_handle = tokio::spawn(st.for_each_concurrent(8, |_v| async {}));
+
+    let poller = Poller::new(pool);
+    let runner = Runner::new(poller, std::time::Duration::from_secs(1));
+    let run_handle = runner.run(
+        |data: Message| async move {
+            let _res = tokio::spawn(async move {
+                println!("Processing: {}", data.text);
+            })
+            .await;
+
+            Result::<(), std::convert::Infallible>::Ok(())
+        },
+        16,
+    );
+
+    let _ = tokio::join!(push_handle, run_handle);
 }
