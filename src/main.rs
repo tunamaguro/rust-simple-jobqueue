@@ -62,8 +62,14 @@ impl<Data: Serialize + DeserializeOwned> Client<Data> {
 }
 
 #[derive(Debug)]
-pub struct JobData<T> {
+pub struct PollerContext {
     id: sqlx::types::Uuid,
+    tx: sqlx::Transaction<'static, sqlx::Postgres>,
+}
+
+#[derive(Debug)]
+pub struct JobData<T> {
+    context: PollerContext,
     data: T,
 }
 
@@ -77,25 +83,12 @@ impl Poller {
         Self { pool }
     }
 
-    async fn poll_and_run<F, Fut, T, E>(
+    async fn poll<T: serde::de::DeserializeOwned>(
         &self,
-        func: F,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>>
-    where
-        F: Fn(T) -> Fut,
-        Fut: Future<Output = Result<(), E>>,
-        T: serde::de::DeserializeOwned,
-        E: std::error::Error + Send + Sync + 'static,
-    {
+    ) -> Result<JobData<T>, Box<dyn std::error::Error + Send + Sync + 'static>> {
         let mut tx = self.pool.begin().await?;
 
-        struct JobData {
-            id: sqlx::types::Uuid,
-            args: serde_json::Value,
-        }
-
-        let data = sqlx::query_as!(
-            JobData,
+        let data = sqlx::query!(
             r#"
             DELETE 
             FROM job_waiting
@@ -113,9 +106,30 @@ impl Poller {
         .fetch_one(&mut *tx)
         .await?;
 
-        let args = serde_json::from_value::<T>(data.args)?;
-        func(args).await?;
-        tx.commit().await?;
+        let context = PollerContext { id: data.id, tx };
+        let value = serde_json::from_value::<T>(data.args)?;
+
+        let data = JobData {
+            context,
+            data: value,
+        };
+
+        Ok(data)
+    }
+
+    async fn poll_and_run<F, Fut, T, E>(
+        &self,
+        func: F,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>>
+    where
+        F: Fn(T) -> Fut,
+        Fut: Future<Output = Result<(), E>>,
+        T: serde::de::DeserializeOwned,
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        let job = self.poll::<T>().await?;
+        func(job.data).await?;
+        job.context.tx.commit().await?;
 
         Ok(())
     }
