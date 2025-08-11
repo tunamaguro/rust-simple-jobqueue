@@ -232,10 +232,10 @@ async fn main() {
         })
         .buffer_unordered(8);
 
-    let push_handle = tokio::spawn(st.for_each_concurrent(8, |_v| async {}));
+    let push_handle = tokio::spawn(st.for_each_concurrent(1, |_v| async {}));
 
     let poller = Poller::new(pool);
-    let runner = Runner::new(poller, std::time::Duration::from_secs(1));
+    let runner = Runner::new(poller, std::time::Duration::from_millis(100));
     let run_handle = runner.run(
         |data: Message| async move {
             let _res = tokio::spawn(async move {
