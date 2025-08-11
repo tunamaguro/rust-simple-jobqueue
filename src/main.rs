@@ -1,7 +1,6 @@
 use std::marker::PhantomData;
-use std::sync::Arc;
 
-use futures::{FutureExt, StreamExt as _, TryStreamExt as _};
+use futures::StreamExt as _;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sqlx::PgPool;
 
@@ -35,6 +34,24 @@ impl From<sqlx::Error> for ClientError {
 impl From<serde_json::Error> for ClientError {
     fn from(value: serde_json::Error) -> Self {
         ClientError::Encode(value)
+    }
+}
+
+impl std::fmt::Display for ClientError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClientError::DataBase(e) => write!(f, "Database error: {}", e),
+            ClientError::Encode(e) => write!(f, "Encoding error: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for ClientError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ClientError::DataBase(e) => Some(e),
+            ClientError::Encode(e) => Some(e),
+        }
     }
 }
 
@@ -92,6 +109,7 @@ pub struct JobData<T> {
 
 #[derive(Debug)]
 pub struct PollerContext {
+    #[allow(dead_code)]
     id: sqlx::types::Uuid,
     tx: sqlx::Transaction<'static, sqlx::Postgres>,
 }
@@ -138,23 +156,6 @@ impl Poller {
         };
 
         Ok(data)
-    }
-
-    async fn poll_and_run<F, Fut, T, E>(
-        &self,
-        func: F,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>>
-    where
-        F: Fn(T) -> Fut,
-        Fut: Future<Output = Result<(), E>>,
-        T: serde::de::DeserializeOwned,
-        E: std::error::Error + Send + Sync + 'static,
-    {
-        let job = self.poll::<T>().await?;
-        func(job.data).await?;
-        job.context.tx.commit().await?;
-
-        Ok(())
     }
 }
 
