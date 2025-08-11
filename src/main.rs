@@ -66,12 +66,12 @@ impl<Data: Serialize + DeserializeOwned> Client<Data> {
     {
         let mut conn = tx.acquire().await?;
         let args = serde_json::to_value(data)?;
-        sqlx::query!(
+        sqlx::query(
             "
             INSERT INTO job_waiting (args) VALUES ($1)
             ",
-            args
         )
+        .bind(args)
         .execute(&mut *conn)
         .await?;
         Ok(())
@@ -129,7 +129,13 @@ impl Poller {
     ) -> Result<JobData<T>, Box<dyn std::error::Error + Send + Sync + 'static>> {
         let mut tx = self.pool.begin().await?;
 
-        let data = sqlx::query!(
+        #[derive(Debug, sqlx::FromRow)]
+        struct QueryResult {
+            id: sqlx::types::Uuid,
+            args: serde_json::Value,
+        }
+
+        let data = sqlx::query_as::<_, QueryResult>(
             r#"
             DELETE 
             FROM job_waiting
@@ -142,7 +148,7 @@ impl Poller {
                 FOR UPDATE SKIP LOCKED
             )
             RETURNING id,args
-        "#
+        "#,
         )
         .fetch_one(&mut *tx)
         .await?;
