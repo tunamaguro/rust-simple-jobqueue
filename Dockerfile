@@ -1,5 +1,8 @@
 FROM mcr.microsoft.com/devcontainers/rust:1-1-bookworm
 
+# Copy sqlc bin
+COPY --from=sqlc/sqlc:1.28.0 /workspace/sqlc /usr/bin/sqlc
+
 ARG USERNAME=vscode
 USER ${USERNAME}
 
