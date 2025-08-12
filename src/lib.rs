@@ -1,6 +1,6 @@
-use anyhow::Context;
-use futures::{Stream, StreamExt as _, TryStreamExt as _};
+use futures::{FutureExt as _, Stream, StreamExt as _};
 use serde::{Serialize, de::DeserializeOwned};
+use tracing::Instrument;
 
 #[allow(warnings)]
 mod queries;
@@ -10,6 +10,8 @@ pub struct Job<Context, Data> {
     pub data: Data,
 }
 
+const PG_LEASE_SECONDS: i32 = 60;
+
 #[derive(Debug)]
 pub struct PgOutTxContext {
     id: sqlx::types::Uuid,
@@ -17,7 +19,17 @@ pub struct PgOutTxContext {
 }
 
 impl PgOutTxContext {
-    async fn complete(self) -> Result<(), anyhow::Error> {
+    async fn heartbeat(&self) -> Result<(), anyhow::Error> {
+        queries::HeartbeatJob::builder()
+            .id(self.id)
+            .lease_seconds(PG_LEASE_SECONDS)
+            .build()
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn complete(&self) -> Result<(), anyhow::Error> {
         queries::CompleteJob::builder()
             .id(self.id)
             .build()
@@ -26,7 +38,7 @@ impl PgOutTxContext {
         Ok(())
     }
 
-    async fn fail(self) -> Result<(), anyhow::Error> {
+    async fn fail(&self) -> Result<(), anyhow::Error> {
         queries::FailJob::builder()
             .id(self.id)
             .build()
@@ -35,7 +47,7 @@ impl PgOutTxContext {
         Ok(())
     }
 
-    async fn retry(self, retry_after: Option<std::time::Duration>) -> Result<(), anyhow::Error> {
+    async fn retry(&self, retry_after: Option<std::time::Duration>) -> Result<(), anyhow::Error> {
         let duration = retry_after.unwrap_or(std::time::Duration::from_secs(15));
         let interval = sqlx::postgres::types::PgInterval::try_from(duration)
             .map_err(|e| anyhow::anyhow!(e))?;
@@ -51,16 +63,25 @@ impl PgOutTxContext {
     }
 }
 
-pub type PgJobData<T> = Job<PgOutTxContext, T>;
+pub type PgJob<T> = Job<PgOutTxContext, T>;
 
 struct Ticker {
     inner: tokio::time::Interval,
 }
 
 impl Ticker {
-    fn new(interval: std::time::Duration) -> Self {
+    fn new(period: std::time::Duration) -> Self {
+        let start = tokio::time::Instant::now() + period;
         Self {
-            inner: tokio::time::interval(interval),
+            inner: tokio::time::interval_at(start, period),
+        }
+    }
+
+    fn tick_after(self) -> Self {
+        let period = self.inner.period();
+        let start = tokio::time::Instant::now() + period;
+        Self {
+            inner: tokio::time::interval_at(start, period),
         }
     }
 }
@@ -101,9 +122,10 @@ where
         }
     }
 
-    pub async fn poll_job(&self, batch_size: u16) -> Vec<Result<PgJobData<T>, anyhow::Error>> {
+    pub async fn poll_job(&self, batch_size: u16) -> Vec<Result<PgJob<T>, anyhow::Error>> {
         let q = queries::PollJobs::builder()
-            .limit(batch_size.into())
+            .batch_size(batch_size.into())
+            .lease_seconds(PG_LEASE_SECONDS)
             .build();
         let jobs = q
             .query_as()
@@ -111,7 +133,7 @@ where
             .map(|res| match res {
                 Ok(row) => {
                     let data = serde_json::from_value::<T>(row.args)?;
-                    Ok(PgJobData {
+                    Ok(PgJob {
                         context: PgOutTxContext {
                             id: row.id,
                             pool: self.pool.clone(),
@@ -131,7 +153,7 @@ where
         &self,
         interval: std::time::Duration,
         batch_size: u16,
-    ) -> impl Stream<Item = Result<PgJobData<T>, anyhow::Error>> + 'static {
+    ) -> impl Stream<Item = Result<PgJob<T>, anyhow::Error>> + 'static {
         self.to_stream_until(interval, batch_size, futures::future::pending::<()>())
     }
 
@@ -140,7 +162,7 @@ where
         interval: std::time::Duration,
         batch_size: u16,
         signal: Fut,
-    ) -> impl Stream<Item = Result<PgJobData<T>, anyhow::Error>> + 'static
+    ) -> impl Stream<Item = Result<PgJob<T>, anyhow::Error>> + 'static
     where
         Fut: Future + Send + 'static,
     {
@@ -173,9 +195,9 @@ pub struct Worker<T, S, F> {
 impl<T, S, F, Fut> Worker<T, S, F>
 where
     T: DeserializeOwned,
-    S: Stream<Item = Result<PgJobData<T>, anyhow::Error>>,
-    F: Fn(T) -> Fut,
-    Fut: Future<Output = JobResult>,
+    S: Stream<Item = Result<PgJob<T>, anyhow::Error>>,
+    F: Fn(T) -> Fut + Send + Sync + Clone + 'static,
+    Fut: Future<Output = JobResult> + Send,
 {
     pub fn new(stream: S, concurrent: usize, handler: F) -> Self {
         Self {
@@ -197,22 +219,45 @@ where
             .map(|job| async {
                 let context = job.context;
                 let data = job.data;
+
                 tracing::trace!("Start handler");
-                let result = (self.handler)(data).await;
+                let result = {
+                    let hb_every = 1.max(PG_LEASE_SECONDS / 3) as u64;
+                    let mut ticker = Ticker::new(std::time::Duration::from_secs(hb_every)).tick_after();
+
+                    let mut tick = ticker.next().fuse();
+                    let handler_span = tracing::debug_span!("Job handler");
+                    let mut handler_fut = (self.handler)(data).instrument(handler_span).boxed().fuse();
+                    loop {
+                        futures::select! {
+                            res = handler_fut => break res,
+                            _ = tick =>{
+                                let span = tracing::debug_span!("Job heartbeat");
+                                let _res = context.heartbeat().instrument(span).await.inspect_err(
+                                    |error| tracing::error!(error = %error, "Failed to heartbeat job"),
+                                );
+                                tick = ticker.next().fuse();
+                            }
+                        }
+                    }
+                };
                 tracing::trace!("Finish handler");
                 match result {
                     JobResult::Success => {
-                        let _res = context.complete().await.inspect_err(
+                        let span = tracing::debug_span!("Complete job");
+                        let _res = context.complete().instrument(span).await.inspect_err(
                             |error| tracing::error!(error = %error, "Failed to complete job"),
                         );
                     }
                     JobResult::Retry(retry_after) => {
-                        let _res = context.retry(retry_after).await.inspect_err(
+                        let span = tracing::debug_span!("Retry job");
+                        let _res = context.retry(retry_after).instrument(span).await.inspect_err(
                             |error| tracing::error!(error = %error, "Failed to retry job"),
                         );
                     }
                     JobResult::Abort => {
-                        let _res = context.fail().await.inspect_err(
+                        let span = tracing::debug_span!("Abort job");
+                        let _res = context.fail().instrument(span).await.inspect_err(
                             |error| tracing::error!(error = %error, "Failed to abort job"),
                         );
                     }

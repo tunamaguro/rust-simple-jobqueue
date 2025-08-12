@@ -1,22 +1,33 @@
 -- name: PollJobs :many
-WITH picked AS (
-  SELECT id, scheduled_at
-  FROM jobs
-  WHERE status = 'pending'
-  ORDER BY scheduled_at ASC
-  FOR UPDATE SKIP LOCKED
-  LIMIT $1
-),
-updated AS (
-  UPDATE jobs j
-  SET status = 'running'
-  FROM picked
-  WHERE j.id = picked.id
-  RETURNING j.id, j.args, j.scheduled_at
-)
-SELECT id, args
-FROM updated
-ORDER BY scheduled_at ASC; 
+UPDATE 
+  jobs j
+SET
+  status = 'running',
+  attempts = j.attempts + 1,
+  lease_expires_at = clock_timestamp() + make_interval(secs := sqlc.arg(lease_seconds)::integer)
+WHERE 
+  id in (
+    SELECT 
+      id 
+    FROM
+      jobs
+    WHERE 
+      (status = 'pending' AND scheduled_at <= clock_timestamp())
+      OR
+      (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= clock_timestamp())
+    ORDER BY scheduled_at ASC
+    FOR UPDATE SKIP LOCKED
+    LIMIT sqlc.arg(batch_size)
+  )
+RETURNING j.id, j.args;
+
+-- name: HeartbeatJob :exec
+UPDATE 
+  jobs j
+SET
+  lease_expires_at = clock_timestamp() + make_interval(secs := sqlc.arg(lease_seconds)::integer)
+WHERE
+  id = $1;
 
 -- name: CompleteJob :exec
 UPDATE jobs

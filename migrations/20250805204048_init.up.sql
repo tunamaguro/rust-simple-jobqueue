@@ -8,6 +8,10 @@ CREATE TABLE IF NOT EXISTS  jobs (
     created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     scheduled_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     
+    lease_expires_at TIMESTAMPTZ,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 25,
+    
     args jsonb NOT NULL,
     
     PRIMARY KEY (id)
