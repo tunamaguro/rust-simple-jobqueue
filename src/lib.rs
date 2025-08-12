@@ -101,9 +101,9 @@ where
         }
     }
 
-    pub async fn poll_job(&self, batch_size: usize) -> Vec<Result<PgJobData<T>, anyhow::Error>> {
+    pub async fn poll_job(&self, batch_size: u16) -> Vec<Result<PgJobData<T>, anyhow::Error>> {
         let q = queries::PollJobs::builder()
-            .limit(batch_size.try_into().unwrap_or(5))
+            .limit(batch_size.into())
             .build();
         let jobs = q
             .query_as()
@@ -123,17 +123,30 @@ where
             })
             .collect::<Vec<_>>()
             .await;
-
+        tracing::trace!("Fetched {} jobs", jobs.len());
         jobs
     }
 
     pub fn to_stream(
         &self,
         interval: std::time::Duration,
-        batch_size: usize,
+        batch_size: u16,
     ) -> impl Stream<Item = Result<PgJobData<T>, anyhow::Error>> + 'static {
-        let ticker = Ticker::new(interval);
+        self.to_stream_until(interval, batch_size, futures::future::pending::<()>())
+    }
+
+    pub fn to_stream_until<Fut>(
+        &self,
+        interval: std::time::Duration,
+        batch_size: u16,
+        signal: Fut,
+    ) -> impl Stream<Item = Result<PgJobData<T>, anyhow::Error>> + 'static
+    where
+        Fut: Future + Send + 'static,
+    {
+        let ticker = Ticker::new(interval).take_until(signal);
         let backend = std::sync::Arc::new(self.clone());
+
         let jobs_st = ticker.then(move |_| {
             let backend = backend.clone();
             async move { backend.poll_job(batch_size).await }
@@ -159,10 +172,10 @@ pub struct Worker<T, S, F> {
 
 impl<T, S, F, Fut> Worker<T, S, F>
 where
-    T: DeserializeOwned + Send + 'static,
-    S: Stream<Item = Result<PgJobData<T>, anyhow::Error>> + Unpin,
-    F: Fn(T) -> Fut + Clone + Send + Sync + 'static,
-    Fut: Future<Output = JobResult> + Send + 'static,
+    T: DeserializeOwned,
+    S: Stream<Item = Result<PgJobData<T>, anyhow::Error>>,
+    F: Fn(T) -> Fut,
+    Fut: Future<Output = JobResult>,
 {
     pub fn new(stream: S, concurrent: usize, handler: F) -> Self {
         Self {
@@ -173,42 +186,42 @@ where
         }
     }
 
-    pub async fn run(self) -> Result<(), anyhow::Error> {
+    pub async fn run(self) {
         let stream = self.stream;
 
         let fut = stream
+            .filter_map(|job| async {
+                job.inspect_err(|error| tracing::error!(error = %error, "Failed to fetch job"))
+                    .ok()
+            })
             .map(|job| async {
-                let job = match job {
-                    Ok(job) => job,
-                    Err(e) => {
-                        println!("Error fetching job: {:?}", e);
-                        return Err(e);
-                    }
-                };
-
                 let context = job.context;
                 let data = job.data;
-                println!("Running handler");
+                tracing::trace!("Start handler");
                 let result = (self.handler)(data).await;
-                println!("Finish handler");
+                tracing::trace!("Finish handler");
                 match result {
                     JobResult::Success => {
-                        context.complete().await.context("failed to complete job")?
+                        let _res = context.complete().await.inspect_err(
+                            |error| tracing::error!(error = %error, "Failed to complete job"),
+                        );
                     }
-                    JobResult::Retry(retry_after) => context
-                        .retry(retry_after)
-                        .await
-                        .context("failed to retry job")?,
-                    JobResult::Abort => context.fail().await.context("failed to abort job")?,
+                    JobResult::Retry(retry_after) => {
+                        let _res = context.retry(retry_after).await.inspect_err(
+                            |error| tracing::error!(error = %error, "Failed to retry job"),
+                        );
+                    }
+                    JobResult::Abort => {
+                        let _res = context.fail().await.inspect_err(
+                            |error| tracing::error!(error = %error, "Failed to abort job"),
+                        );
+                    }
                 };
-                Result::<(), anyhow::Error>::Ok(())
             })
             .buffer_unordered(self.concurrent)
-            .try_fold((), |_, res| async move { Ok(res) });
+            .for_each(async |_| {});
 
-        fut.await?;
-
-        Ok(())
+        fut.await;
     }
 }
 
